@@ -1,6 +1,6 @@
-# KahootHelper `1.1.5`
+# KahootHelper `1.1.6`
 
-This is a Kahoot cheat made for browsers and Tampermonkey.
+This is a Kahoot cheat made for browsers and Tampermonkey – **and it now works on kahoot-like clone sites too** (rogbeast.de, pages.dev mirrors, embedded game portals), not just kahoot.it.
 (Forked/fixed from [KaHoax](https://github.com/KRWCLASSIC/KaHoax) – see "Fixes" below.)
 
 ## Instructions (Manual)
@@ -10,6 +10,17 @@ This is a Kahoot cheat made for browsers and Tampermonkey.
 2. Click raw to install this script to Tampermonkey or copy-paste it on the console. Ctrl+Shift+i opens the developer tab and there you can find the console. Paste the code there and press enter to run it.
 
 3. Type in the quiz ID. You should see it on the host's screen. If the quiz ID box is still red after typing in the right quiz ID that means the Kahoot is private and this cannot be used with it.
+
+### Works without Tampermonkey ("integrated Tampermonkey")
+
+The script contains a built-in `GM_xmlhttpRequest` shim:
+
+- **With Tampermonkey/Violentmonkey:** the real `GM_xmlhttpRequest` is used (proxy requests bypass CORS via `@connect`).
+- **Without any extension** (console paste, bookmarklet, or injected `<script>` tag into a clone site): all quiz-API calls automatically fall back to an internal XHR layer, so the quiz lookup/search keeps working exactly like under Tampermonkey.
+
+### Kahoot-like sites & iframes
+
+Instead of only running on `kahoot.it`, the script **auto-detects the Kahoot layout** (`data-functional-selector` attributes / game-pin input) on any matched page and starts itself as soon as that structure appears – even in SPAs that render late, and inside cross-origin-friendly iframes on game portals. On foreign pages where no Kahoot structure shows up within 30 s, it never injects its overlay. Supported example domains (add more via `@match`): `*.rogbeast.de`, `*.pages.dev` mirrors, CrazyGames/Poki-style embeds, plus any URL containing "kahoot".
 
 ## Features
 
@@ -27,6 +38,12 @@ The latest version includes Auto Answer, Show Answers and Quiz search based on J
 3. **Mobile toggle bug fixed** ("toggles stuck on enabled"): the hidden checkboxes now sit exactly on top of their switches so their state can never desync from the visual slider; when the menu reopens, both toggles are properly reset to off.
 4. **Closing the menu no longer ends the script unrecoverably** – reopen via triple-tap on the profile avatar (see above).
 5. Renamed project to **KahootHelper** (userscript header, title bar, meta file, icon/update/download URLs).
+
+## New in 1.1.6
+
+- **Runs on kahoot-like clone sites**, not only kahoot.it: extra `@match` rules plus runtime Kahoot-layout auto-detection (works with late-rendering SPAs and iframe embeds; never shows an overlay on pages that aren't Kahoot).
+- **"Integrated Tampermonkey":** built-in `GM_xmlhttpRequest` shim with automatic XHR fallback, so quiz lookup/search works even when pasted into the console or injected without any userscript manager.
+- `@run-at document-start` so detection catches the page before/while it renders.
 
 ## TODO etc
 

@@ -1,14 +1,112 @@
 // ==UserScript==
 // @name         KahootHelper
-// @version      1.1.5
-// @description  A hack for kahoot.it! First tries proxy lookup by Quiz ID. If that fails, uses fallback search and displays a scrollable dropdown for selection.
+// @version      1.1.6
+// @description  A hack for kahoot.it AND kahoot-like clone sites (rogbeast.de, pages.dev mirrors, embedded game portals). Auto-detects Kahoot layout; works with or without Tampermonkey (built-in GM_xmlhttpRequest shim). First tries proxy lookup by Quiz ID. If that fails, uses fallback search and displays a scrollable dropdown for selection. Close menu -> reopen by tapping the profile avatar 3 times.
 // @namespace    https://github.com/KRWCLASSIC
 // @match        https://kahoot.it/*
+// @match        https://app.kahoot.com/*
+// @match        *://*.rogbeast.de/*
+// @match        *://rogbeast.pages.dev/*
+// @match        *://*.rogbeast.pages.dev/*
+// @match        *://kahoot-scrim.pages.dev/*
+// @match        *://*.it-was-kahoot-clone.pages.dev/*
+// @match        *://*.itwas-kahoot.pages.dev/*
+// @match        https://www.crazygames.com/game/kahoot-it/*
+// @match        https://playgame.io/games/kahoot/*
+// @match        https://poki.com/de/g/kahoot-answer/*
+// @match        https://*/*kahoot*
 // @icon         https://raw.githubusercontent.com/KRWCLASSIC/KahootHelper/refs/heads/main/kahoot.svg
-// @grant        none
+// @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @connect      damp-leaf-16aa.johnwee.workers.dev
+// @connect      create.kahoot.it
 // ==/UserScript==
 (function() {
-    var Version = '1.1.5';
+    'use strict';
+    var Version = '1.1.6';
+
+    // ===================== KAHOOT-ERKENNUNG (Domain-unabhaengig) =====================
+    // Das Skript laeuft auf kahoot.it, aber auch auf jeder "kahoot-aehnlichen" Seite
+    // (Klone wie rogbeast.de, pages.dev-Mirrors, eingebettete Spiel-Portale).
+    // Erkennung ueber die typischen data-functional-selector Attribute von Kahoot.
+    function looksLikeKahoot(root) {
+        root = root || document;
+        if (!root.querySelector) return false;
+        if (root.querySelector('[data-functional-selector]')) return true;
+        if (root.querySelector('input[name="gameId"]')) return true;
+        return /kahoot/i.test(document.title);
+    }
+
+    function isEmbedded() {
+        try { return window.top !== window.self; } catch (e) { return true; }
+    }
+
+    // Auf Nicht-Kahoot-Domains starten, sobald Kahoot-Struktur erkannt wird;
+    // in Iframes nur bei eindeutigem Kahoot-Inhalt (kein Overlay auf fremden Seiten).
+    var hostIsKahoot = /^https?:\/\/([^/]*\.)?kahoot\.(it|com)(:\d+)?$/i.test(location.origin || location.host);
+    var kahootDetected = hostIsKahoot || looksLikeKahoot();
+    if (!kahootDetected) {
+        // spaetere Erkennung abwarten (z.B. SPA-Klone rendern den Pin-Screen erst nach dem Laden)
+        var _startNow = function() {
+            if (looksLikeKahoot()) {
+                kahootDetected = true;
+                clearInterval(_poll);
+                if (_watcher) _watcher.disconnect();
+                startKahootHelper();
+            }
+        };
+        var _watcher = new MutationObserver(_startNow);
+        var _poll = setInterval(_startNow, 800);
+        document.addEventListener('DOMContentLoaded', function() {
+            if (document.documentElement) _watcher.observe(document.documentElement, {childList: true, subtree: true});
+            _startNow();
+        });
+        // Nach 30 s ohne Kahoot-Struktur nie starten (kein Overlay auf fremden Seiten)
+        setTimeout(function() { clearInterval(_poll); if (_watcher) _watcher.disconnect(); }, 30000);
+    }
+
+    // ===================== INTEGRIERTES TAMPERMONKEY (GM_xmlhttpRequest-Shim) =====================
+    // Damit funktioniert das Skript auch ohne Tampermonkey (z.B. per <script>-Tag oder
+    // Bookmarklet in die Clone-Seite injiziert): alle Quiz-API-Aufrufe laufen dann
+    // automatisch als CORS-freundliche XHRs ueber den Proxy – wie bei Tampermonkey.
+    var GMX = (typeof this !== 'undefined' && typeof this.GM_xmlhttpRequest === 'function')
+        ? this.GM_xmlhttpRequest
+        : null;
+    function gmFetch(url, headers) {
+        return new Promise(function(resolve, reject) {
+            if (GMX) {
+                GMX({
+                    method: 'GET',
+                    url: url,
+                    headers: headers || {},
+                    timeout: 20000,
+                    onload: function(r) { resolve({ ok: r.status >= 200 && r.status < 300, status: r.status, text: function() { return Promise.resolve(r.responseText); }, json: function() { return Promise.resolve(JSON.parse(r.responseText)); } }); },
+                    onerror: function(e) { reject(new Error('network')); },
+                    ontimeout: function() { reject(new Error('timeout')); }
+                });
+                return;
+            }
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', url, true);
+            if (headers) Object.keys(headers).forEach(function(k) { try { xhr.setRequestHeader(k, headers[k]); } catch (e) {} });
+            xhr.timeout = 20000;
+            xhr.onload = function() { resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, text: function() { return Promise.resolve(xhr.responseText); }, json: function() { return Promise.resolve(JSON.parse(xhr.responseText)); } }); };
+            xhr.onerror = function() { reject(new Error('network')); };
+            xhr.ontimeout = function() { reject(new Error('timeout')); };
+            xhr.send();
+        });
+    }
+    // Wenn kein echtes Tampermonkey vorhanden ist, fetch() transparent auf gmFetch umleiten.
+    if (!GMX) {
+        var _origFetch = window.fetch ? window.fetch.bind(window) : null;
+        window.fetch = function(input, init) {
+            var u = (typeof input === 'string') ? input : (input && input.url) || '';
+            if (/damp-leaf-16aa\.johnwee\.workers\.dev/.test(u)) {
+                return gmFetch(u, (init && init.headers) || null);
+            }
+            return _origFetch ? _origFetch(input, init) : Promise.reject(new Error('no fetch'));
+        };
+    }
 
     var questions = [];
     var info = {
@@ -24,6 +122,12 @@
     var showAnswers = false;
     var inputLag = 100; // Ping compensation
     var lastValidQuizID = null; // Store the last successfully loaded quiz ID
+
+    // ===================== KAHOOT-START =====================
+    // Der eigentliche Start (UI + Loop) laeuft erst, wenn Kahoot-Struktur vorhanden ist.
+    function startKahootHelper() {
+        if (window.__kahootHelperStarted) return;
+        window.__kahootHelperStarted = true;
 
     // Helper: Finds an element by attribute value.
     function FindByAttributeValue(attribute, value, element_type) {
@@ -1582,7 +1686,7 @@
     function searchPublicUUID(searchTerm) {
         const searchUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/rest/kahoots/?query=' + encodeURIComponent(searchTerm);
         console.log("Fallback search URL:", searchUrl);
-        fetch(searchUrl)
+        gmFetch(searchUrl)
           .then(response => response.json())
           .then(data => {
               console.log("Fallback search data:", data);
@@ -1630,7 +1734,7 @@
                     item.addEventListener('click', async function() {
                         const quizUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizUUID);
                         try {
-                            const res = await fetch(quizUrl);
+                            const res = await gmFetch(quizUrl);
                             if (!res.ok) throw new Error("Fetch failed");
                             const data = await res.json();
                         
@@ -1982,7 +2086,7 @@
         const url = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizID);
         console.log("Direct lookup URL:", url);
         if (quizID !== "") {
-            fetch(url)
+            gmFetch(url)
                 .then(response => {
                     if (!response.ok) throw new Error('Direct lookup failed');
                     return response.json();
@@ -2411,4 +2515,8 @@
     
     // Run after a short delay to ensure DOM is ready
     setTimeout(applyBadgeClasses, 500);
+    } // <-- end of startKahootHelper()
+
+    // Auf echten Kahoot-Domains (oder bereits erkanntem Kahoot-Layout) sofort starten.
+    if (kahootDetected) startKahootHelper();
 })();
