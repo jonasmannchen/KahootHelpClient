@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         KahootHelper
-// @version      1.1.6
-// @description  A hack for kahoot.it AND kahoot-like clone sites (rogbeast.de, pages.dev mirrors, embedded game portals). Auto-detects Kahoot layout; works with or without Tampermonkey (built-in GM_xmlhttpRequest shim). First tries proxy lookup by Quiz ID. If that fails, uses fallback search and displays a scrollable dropdown for selection. Close menu -> reopen by tapping the profile avatar 3 times.
+// @version      1.2.0
+// @description  KahootHelper - a hack for kahoot.it, kahoot-like clone sites AND your own website (kahoot.kahoothelper.site / any page hosting index.html). Works with or without Tampermonkey: on a self-hosted site the script is loaded directly via <script>-Tag (integrated GM_xmlhttpRequest shim), no extension needed. Auto-loads the quiz of the current Game PIN (with an optional manual Quiz-ID field as fallback). Colored answer marking fixed (small diamond/circle markers instead of neon button paint). Close menu -> reopen by tapping the profile avatar 3 times.
 // @namespace    https://github.com/KRWCLASSIC
 // @match        https://kahoot.it/*
 // @match        https://app.kahoot.com/*
@@ -15,6 +15,7 @@
 // @match        https://playgame.io/games/kahoot/*
 // @match        https://poki.com/de/g/kahoot-answer/*
 // @match        https://*/*kahoot*
+// @match        *://*/*
 // @icon         https://raw.githubusercontent.com/KRWCLASSIC/KahootHelper/refs/heads/main/kahoot.svg
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -23,7 +24,7 @@
 // ==/UserScript==
 (function() {
     'use strict';
-    var Version = '1.1.6';
+    var Version = '1.2.0';
 
     // ===================== KAHOOT-ERKENNUNG (Domain-unabhaengig) =====================
     // Das Skript laeuft auf kahoot.it, aber auch auf jeder "kahoot-aehnlichen" Seite
@@ -34,8 +35,32 @@
         if (!root.querySelector) return false;
         if (root.querySelector('[data-functional-selector]')) return true;
         if (root.querySelector('input[name="gameId"]')) return true;
+        // Eigenes 1:1-Kahoot-Design (z.B. unsere Website kahoot.kahoothelper.site):
+        // Body laesst sich ueber data-kahoot-helper-theme erkennen.
+        if (document.body && document.body.getAttribute('data-kahoot-helper-theme') === 'kahoot') return true;
+        if (root.querySelector && root.querySelector('#kahoot-helper-site')) return true;
         return /kahoot/i.test(document.title);
     }
+
+    // ===================== KAHOOT-FARBSCHEMA fuer eigenes Design =====================
+    // Wird auf der eigenen Website (index.html) als CSS-Variablen gesetzt, damit
+    // das Antwort-Markierungsschema exakt zu Kahoots Buttonfarben passt.
+    var KAHOOT_ANSWER_COLORS = {
+        triangle: '#e21b3c',   // rot
+        diamond:  '#00a8e0',   // blau
+        circle:   '#f5b400',   // gelb
+        square:   '#954afe'    // lila
+    };
+    function injectKahootColorVars() {
+        try {
+            var rs = document.documentElement.style;
+            rs.setProperty('--kh-red', KAHOOT_ANSWER_COLORS.triangle);
+            rs.setProperty('--kh-blue', KAHOOT_ANSWER_COLORS.diamond);
+            rs.setProperty('--kh-yellow', KAHOOT_ANSWER_COLORS.circle);
+            rs.setProperty('--kh-purple', KAHOOT_ANSWER_COLORS.square);
+        } catch (e) {}
+    }
+    injectKahootColorVars();
 
     function isEmbedded() {
         try { return window.top !== window.self; } catch (e) { return true; }
@@ -44,7 +69,10 @@
     // Auf Nicht-Kahoot-Domains starten, sobald Kahoot-Struktur erkannt wird;
     // in Iframes nur bei eindeutigem Kahoot-Inhalt (kein Overlay auf fremden Seiten).
     var hostIsKahoot = /^https?:\/\/([^/]*\.)?kahoot\.(it|com)(:\d+)?$/i.test(location.origin || location.host);
-    var kahootDetected = hostIsKahoot || looksLikeKahoot();
+    // "eigene Seite": die Website, die dieses Skript per <script>-Tag einbindet
+    // (z.B. kahoot.kahoothelper.site / GitHub Pages Deployment von index.html).
+    var ownSite = document.body && document.body.getAttribute('data-kahoot-helper-theme') === 'kahoot';
+    var kahootDetected = hostIsKahoot || ownSite || looksLikeKahoot();
     if (!kahootDetected) {
         // spaetere Erkennung abwarten (z.B. SPA-Klone rendern den Pin-Screen erst nach dem Laden)
         var _startNow = function() {
@@ -61,8 +89,15 @@
             if (document.documentElement) _watcher.observe(document.documentElement, {childList: true, subtree: true});
             _startNow();
         });
-        // Nach 30 s ohne Kahoot-Struktur nie starten (kein Overlay auf fremden Seiten)
-        setTimeout(function() { clearInterval(_poll); if (_watcher) _watcher.disconnect(); }, 30000);
+        // Nach 5 min ohne Kahoot-Struktur aufgeben (kein Overlay auf fremden Seiten).
+        // Hinweis: auf der eigenen Website laeuft das Skript immer sofort, weil der
+        // Body dort data-kahoot-helper-theme="kahoot" setzt.
+        setTimeout(function() { clearInterval(_poll); if (_watcher) _watcher.disconnect(); }, 300000);
+    } else if (ownSite) {
+        // Auf der eigenen Website DOM-Ready abwarten, falls <script> im <head> steht.
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function() { startKahootHelper(); });
+        }
     }
 
     // ===================== INTEGRIERTES TAMPERMONKEY (GM_xmlhttpRequest-Shim) =====================
@@ -122,6 +157,110 @@
     var showAnswers = false;
     var inputLag = 100; // Ping compensation
     var lastValidQuizID = null; // Store the last successfully loaded quiz ID
+    var autoLoadAttemptedFor = {}; // Game-PINs, bei denen der Auto-Quiz-Load schon versucht wurde
+
+    // ===================== EIGENE WEBSITE: lokale Quiz-Unterstützung =====================
+    // Auf der eigenen Seite (index.html) koennen eigene Quizze ohne Proxy geladen
+    // werden: entweder als JSON-Datei (data-quiz-url) oder inline im Markup.
+    function loadLocalQuizzes() {
+        try {
+            var el = document.getElementById('kahoot-helper-local-quizzes');
+            if (el && el.textContent.trim()) {
+                var data = JSON.parse(el.textContent);
+                applyQuizData(data);
+                return true;
+            }
+            var url = document.body && document.body.getAttribute('data-quiz-url');
+            if (url) {
+                gmFetch(url).then(function(r) {
+                    if (!r.ok) throw new Error('local quiz fetch failed');
+                    return r.json();
+                }).then(function(data) {
+                    applyQuizData(data);
+                }).catch(function(e) { console.warn('KahootHelper: lokales Quiz konnte nicht geladen werden', e); });
+                return true;
+            }
+        } catch (e) {
+            console.warn('KahootHelper: Fehler beim Laden des lokalen Quizses', e);
+        }
+        return false;
+    }
+
+    // Akzeptiert sowohl das kahoot.it-API-Format ({questions:[...]}) als auch ein
+    // einfaches eigenes Format ({title, questions:[{question, answers:[{text, correct}]}]}).
+    function normalizeQuizData(data) {
+        if (!data) return null;
+        if (Array.isArray(data.questions)) {
+            // kahoot.it API Format -> direkt verwenden
+            return data;
+        }
+        if (Array.isArray(data)) {
+            return { title: 'Lokales Quiz', questions: data };
+        }
+        return null;
+    }
+
+    function applyQuizData(rawData) {
+        var data = normalizeQuizData(rawData);
+        if (!data || !Array.isArray(data.questions) || data.questions.length === 0) return;
+        // Einfaches Format in API-Format mappen (falls keine 'choices' vorhanden)
+        data.questions.forEach(function(q) {
+            if (!q.choices && Array.isArray(q.answers)) {
+                q.choices = q.answers.map(function(a) {
+                    if (typeof a === 'string') return { answer: a, correct: false };
+                    return { answer: a.text || '', correct: !!a.correct };
+                });
+            }
+            if (!q.type) q.type = 'quiz';
+            if (q.time == null) q.time = 20000;
+            if (q.question == null) q.question = q.prompt || '[No question text]';
+        });
+        questions = parseQuestions(data.questions);
+        info.numQuestions = questions.length;
+        updateQuestionsList(data.questions);
+        inputBox.style.backgroundColor = 'green';
+        lastValidQuizID = lastValidQuizID || 'local';
+        console.log('KahootHelper: Lokales Quiz geladen (' + questions.length + ' Fragen)');
+    }
+
+    // Auto-Quiz-Load ueber den Game-PIN: erst Pin-Info abfragen, dann Quiz-ID
+    // ueber die oeffentliche Suche ermitteln und laden.
+    function autoLoadQuizByPin(pin) {
+        console.log('KahootHelper: versuche Quiz fuer PIN ' + pin + ' automatisch zu laden...');
+        var infoUrl = 'https://create.kahoot.it/rest/kahoots/pin/' + encodeURIComponent(pin);
+        gmFetch(infoUrl, { 'Accept': 'application/json' })
+            .then(function(r) { if (!r.ok) throw new Error('pin lookup failed'); return r.json(); })
+            .then(function(pinInfo) {
+                var quizId = (pinInfo && (pinInfo.qualifiedContentUniqueId || pinInfo.contentUniqueId)) ||
+                             (pinInfo && pinInfo.game && pinInfo.game.qualifiedContentUniqueId);
+                if (!quizId) throw new Error('no quiz id for pin');
+                return loadQuizById(quizId);
+            })
+            .catch(function(err) {
+                console.warn('KahootHelper: Auto-Load per PIN fehlgeschlagen:', err.message);
+                searchPublicUUID(String(pin));
+            });
+    }
+
+    function loadQuizById(quizId) {
+        var url = 'https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(quizId);
+        return gmFetch(url)
+            .then(function(response) {
+                if (!response.ok) throw new Error('Direct lookup failed');
+                return response.json();
+            })
+            .then(function(data) {
+                inputBox.value = quizId;
+                questions = parseQuestions(data.questions);
+                info.numQuestions = questions.length;
+                lastValidQuizID = quizId;
+                updateQuestionsList(data.questions);
+                inputBox.style.backgroundColor = 'green';
+                dropdown.style.display = 'none';
+                dropdownCloseButton.style.display = 'none';
+                console.log('KahootHelper: Quiz automatisch geladen:', quizId);
+            });
+    }
 
     // ===================== KAHOOT-START =====================
     // Der eigentliche Start (UI + Loop) laeuft erst, wenn Kahoot-Struktur vorhanden ist.
@@ -2226,19 +2365,29 @@
 
     function answer(question, time) {
         Answered_PPT = PPT;
+        // Fix: Auf fremden Seiten/Iframes (eigene Website, Klone) ignoriert Kahoots
+        // React-Code KeyboardEvents von aussen zuverlaessig. Deshalb wird zunaechst
+        // der native Klick auf den Antwortbutton versucht und die Tastatur nur als
+        // Fallback genutzt.
+        function pressAnswer(idx) {
+            var btn = FindByAttributeValue("data-functional-selector", 'answer-' + idx, "button");
+            if (btn) {
+                btn.click();
+                return true;
+            }
+            const event = new KeyboardEvent('keydown', { key: (idx + 1).toString() });
+            window.dispatchEvent(event);
+            return false;
+        }
         var delay = (question.type == 'multiple_select_quiz') ? 60 : 0;
         setTimeout(function() {
             if (question.type == 'quiz') {
-                const key = (+question.answers[0] + 1).toString();
-                const event = new KeyboardEvent('keydown', { key: key });
-                window.dispatchEvent(event);
+                pressAnswer(+question.answers[0] + 1 - 1);
             }
             if (question.type == 'multiple_select_quiz') {
-                question.answers.forEach(function(answer) {
+                question.answers.forEach(function(answerIdx) {
                     setTimeout(function() {
-                        const key = (+answer + 1).toString();
-                        const event = new KeyboardEvent('keydown', { key: key });
-                        window.dispatchEvent(event);
+                        pressAnswer(+answerIdx);
                     }, 0);
                 });
                 setTimeout(function() {
@@ -2337,7 +2486,16 @@
             
             // If we found a PIN in this check or have a stored PIN, use it
             foundPin = foundPin || lastKnownPin;
-            
+
+            // ===== Auto-Quiz-Loading (eigene Website / Klone) =====
+            // Auf der eigenen Seite kennt man die Quiz-ID oft nicht. Wenn ein
+            // Game-PIN erkannt wird und noch kein Quiz geladen ist, versuchen wir
+            // automatisch, das passende Quiz ueber Pin-Info + Proxy zu laden.
+            if (foundPin && questions.length === 0 && !autoLoadAttemptedFor[foundPin]) {
+                autoLoadAttemptedFor[foundPin] = true;
+                autoLoadQuizByPin(foundPin);
+            }
+
             // Only update the display based on page state
             if (isGameRelatedPage()) {
                 // We're on a game page, so display the PIN if available
