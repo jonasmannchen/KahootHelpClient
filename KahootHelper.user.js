@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         KahootHelper
-// @version      1.2.0
-// @description  KahootHelper - a hack for kahoot.it, kahoot-like clone sites AND your own website (kahoot.kahoothelper.site / any page hosting index.html). Works with or without Tampermonkey: on a self-hosted site the script is loaded directly via <script>-Tag (integrated GM_xmlhttpRequest shim), no extension needed. Auto-loads the quiz of the current Game PIN (with an optional manual Quiz-ID field as fallback). Colored answer marking fixed (small diamond/circle markers instead of neon button paint). Close menu -> reopen by tapping the profile avatar 3 times.
+// @version      1.3.0
+// @description  KahootHelper - a hack for kahoot.it, kahoot-like clone sites AND your own website (index.html, 1:1 Kahoot design like kahoax.krwclassic.com). Works with or without Tampermonkey: on a self-hosted site the script is loaded directly via <script>-Tag (integrated GM_xmlhttpRequest shim), no extension needed. AUTO-FIND: automatically searches the real Kahoot library (first 1-3 questions are compared against the live answer buttons) and suggests/loads the matching quiz + its ID. Colored answer marking fixed (small diamond/circle markers instead of neon button paint). Close menu -> reopen by tapping the profile avatar 3 times.
 // @namespace    https://github.com/KRWCLASSIC
 // @match        https://kahoot.it/*
 // @match        https://app.kahoot.com/*
@@ -24,7 +24,7 @@
 // ==/UserScript==
 (function() {
     'use strict';
-    var Version = '1.2.0';
+    var Version = '1.3.0';
 
     // ===================== KAHOOT-ERKENNUNG (Domain-unabhaengig) =====================
     // Das Skript laeuft auf kahoot.it, aber auch auf jeder "kahoot-aehnlichen" Seite
@@ -262,9 +262,230 @@
             });
     }
 
+    // ===================== AUTO-FIND: Quiz automatisch erkennen =====================
+    // Wenn kein Quiz geladen ist, aber Antwort-Buttons auf dem Bildschirm erscheinen,
+    // liest das Skript die ersten 1-3 Fragen (Fragentext + Antworttexte) aus dem DOM,
+    // sucht sie automatisch in der echten Kahoot-Bibliothek und baut das gefundene
+    // Quiz (Titel + Quiz-ID) direkt ins Menü ein. Zusätzlich wird die Quiz-ID als
+    // <script type="application/json" id="kahoot-helper-found-quiz"> in die Seite
+    // geschrieben – so merkt sich die Website das gefundene Quiz (localStorage) und
+    // zeigt es bei einem erneuten Besuch sofort an.
+    var autoFindRunning = false;
+    var autoFindDoneFor = {};      // Fragetexte, für die bereits gesucht wurde
+    var lastQuestionTextSeen = null;
+
+    function stripHtml(s) {
+        var t = document.createElement('textarea');
+        t.innerHTML = String(s || '');
+        return (t.value || '').replace(/\s+/g, ' ').trim();
+    }
+
+    // Liest Frage + Antworten aus dem echten kahoot.it / Klon-DOM.
+    function readLiveQuestionFromDom() {
+        var qTextEl = FindByAttributeValue('data-functional-selector', 'question-text', '*') ||
+                      FindByAttributeValue('data-functional-selector', 'question', '*');
+        if (!qTextEl) return null;
+        var questionText = stripHtml(qTextEl.textContent);
+        if (!questionText) return null;
+        var answers = [];
+        for (var i = 0; i < 4; i++) {
+            var btn = FindByAttributeValue('data-functional-selector', 'answer-' + i, 'button');
+            if (!btn) continue;
+            var ansEl = btn.querySelector('[class*="answer"], [class*="Answer"]') || btn;
+            var txt = stripHtml(ansEl.textContent);
+            // Fuehrende Form-/Zahlen-Badges (Dreieck/Raute/Kreis/Quadrat + 1-4) entfernen
+            txt = txt.replace(/^(?:\d|[A-Za-z])[\s\u200b]*/, '');
+            answers.push(txt);
+        }
+        if (answers.filter(Boolean).length < 2) return null;
+        return { question: questionText, answers: answers };
+    }
+
+    // Liest live vom eigenen Demo-Bildschirm (index.html), falls dort gerade
+    // ein Vorschau-Quiz angezeigt wird.
+    function readLiveQuestionFromDemoScreen() {
+        var qEl = document.getElementById('kh-demo-question');
+        if (!qEl) return null;
+        var questionText = stripHtml(qEl.textContent);
+        if (!questionText) return null;
+        var answers = [];
+        var btns = document.querySelectorAll('#kh-demo-grid .kh-answer-btn');
+        btns.forEach(function(b) { answers.push(stripHtml(b.getAttribute('data-text') || b.textContent)); });
+        if (answers.filter(Boolean).length < 2) return null;
+        return { question: questionText, answers: answers };
+    }
+
+    function readLiveQuestion() {
+        return readLiveQuestionFromDom() || readLiveQuestionFromDemoScreen();
+    }
+
+    // Normalisiert Text fuer den Vergleich (Kleinschreibung, ohne HTML/Zeichen).
+    function normText(s) {
+        return stripHtml(s).toLowerCase()
+            .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, ' ').trim();
+    }
+
+    // Punktzahl 0..1: wie gut passen die Live-Antworten zu einem Kandidaten-Quiz?
+    function scoreCandidate(candidate, live) {
+        var cq = candidate.question;
+        var qMatch = 0;
+        var nLiveQ = normText(cq.question || '');
+        var nTarget = normText(live.question);
+        if (nLiveQ && nTarget) {
+            if (nLiveQ === nTarget) qMatch = 1;
+            else if (nLiveQ.indexOf(nTarget) !== -1 || nTarget.indexOf(nLiveQ) !== -1) qMatch = 0.8;
+            else {
+                var wordsA = nLiveQ.split(' '), wordsB = nTarget.split(' ');
+                var common = wordsA.filter(function(w){ return w.length > 2 && wordsB.indexOf(w) !== -1; }).length;
+                qMatch = Math.min(0.7, common / Math.max(2, Math.min(wordsA.length, wordsB.length)));
+            }
+        }
+        var ansMatch = 0, matched = 0;
+        (cq.choices || []).forEach(function(ch) {
+            var a = normText(ch.answer || ch.text || '');
+            if (!a) return;
+            var hit = live.answers.some(function(la) {
+                var n = normText(la);
+                return n && (n === a || n.indexOf(a) !== -1 || a.indexOf(n) !== -1);
+            });
+            if (hit) { matched++; ansMatch += 0.25; }
+        });
+        var total = qMatch * 0.55 + Math.min(1, ansMatch) * 0.45;
+        if (matched >= 2) total += 0.1;   // Bonus: mehrere Antworten treffen ueberein
+        return Math.min(1, total);
+    }
+
+    function reportFoundQuizToSite(found) {
+        try {
+            var el = document.getElementById('kahoot-helper-found-quiz');
+            if (!el) {
+                el = document.createElement('script');
+                el.type = 'application/json';
+                el.id = 'kahoot-helper-found-quiz';
+                document.body.appendChild(el);
+            }
+            el.textContent = JSON.stringify(found);
+            console.log('KahootHelper Auto-Find: Ergebnis an die Website gemeldet:', found);
+        } catch (e) {}
+    }
+
+    function runAutoFind(live) {
+        if (autoFindRunning || questions.length > 0) return;
+        autoFindRunning = true;
+        console.log('KahootHelper Auto-Find: suche Kahoot-Bibliothek nach der aktuellen Frage...');
+        var searchTerm = normText(live.question).replace(/ /g, '+').slice(0, 80);
+        var searchUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/rest/kahoots/?query=' + encodeURIComponent(searchTerm) + '&limit=10';
+        gmFetch(searchUrl, { 'Accept': 'application/json' })
+            .then(function(r) { if (!r.ok) throw new Error('search failed'); return r.json(); })
+            .then(function(data) {
+                var entities = (data && data.entities) || [];
+                var uuids = entities.map(function(e){ return e.card && e.card.uuid; }).filter(Boolean).slice(0, 6);
+                if (uuids.length === 0) throw new Error('no search results');
+                // alle Kandidaten-Quizze laden und gegen die Live-Frage vergleichen
+                return Promise.all(uuids.map(function(uid) {
+                    return gmFetch('https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(uid))
+                        .then(function(rr) { return rr.ok ? rr.json() : null; })
+                        .catch(function(){ return null; });
+                })).then(function(quizzes) {
+                    var best = null;
+                    quizzes.forEach(function(d, idx) {
+                        if (!d || !Array.isArray(d.questions)) return;
+                        d.questions.forEach(function(cq) {
+                            if (!cq || cq.type !== 'quiz' || !Array.isArray(cq.choices)) return;
+                            var sc = scoreCandidate({ question: cq }, live);
+                            if (!best || sc > best.score) {
+                                best = { score: sc, quiz: d, candidateQuestion: cq, uuid: d.uuid || uuids[idx], title: d.title || '' };
+                            }
+                        });
+                    });
+                    if (!best || best.score < 0.5) {
+                        console.log('KahootHelper Auto-Find: kein Treffer (bestes Matching: ' + (best ? Math.round(best.score*100) : 0) + '%). Suche stattdessen per Titel...');
+                        return fallbackTitleSearch(live);
+                    }
+                    applyAutoFindResult(best);
+                });
+            })
+            .catch(function(err) {
+                console.warn('KahootHelper Auto-Find fehlgeschlagen:', err.message);
+            })
+            .then(function() { autoFindRunning = false; });
+    }
+
+    // Fallback: zerlege die Frage in moegliche Suchbegriffe (z.B. Laendernamen)
+    function fallbackTitleSearch(live) {
+        var m = (live.question || '').match(/(?:of|for|über|su|de)\s+(?:the\s+)?<?b?>?\s*([A-ZÄÖÜ][\wÄÖÜäöüß'’\- ]{2,30})/);
+        var term = m ? m[1].trim() : normText(live.question).split(' ').slice(0, 3).join(' ');
+        if (!term) return;
+        var searchUrl = 'https://damp-leaf-16aa.johnwee.workers.dev/rest/kahoots/?query=' + encodeURIComponent(term) + '&limit=8';
+        return gmFetch(searchUrl, { 'Accept': 'application/json' })
+            .then(function(r) { return r.ok ? r.json() : null; })
+            .then(function(data) {
+                var entities = (data && data.entities) || [];
+                if (!entities.length) return;
+                var first = entities[0].card || {};
+                var uid = first.uuid;
+                if (!uid) return;
+                return gmFetch('https://damp-leaf-16aa.johnwee.workers.dev/api-proxy/' + encodeURIComponent(uid))
+                    .then(function(rr) { return rr.ok ? rr.json() : null; })
+                    .then(function(d) {
+                        if (!d || !Array.isArray(d.questions)) return;
+                        var best = null;
+                        d.questions.forEach(function(cq) {
+                            if (!cq || cq.type !== 'quiz' || !Array.isArray(cq.choices)) return;
+                            var sc = scoreCandidate({ question: cq }, live);
+                            if (!best || sc > best.score) best = { score: sc, quiz: d, candidateQuestion: cq, uuid: uid, title: d.title || first.title || '' };
+                        });
+                        if (best && best.score >= 0.45) applyAutoFindResult(best);
+                    });
+            })
+            .catch(function(){});
+    }
+
+    function applyAutoFindResult(best) {
+        console.log('KahootHelper Auto-Find: Quiz gefunden! "' + best.title + '" (ID: ' + best.uuid + ', Match ' + Math.round(best.score*100) + '%)');
+        loadQuizById(best.uuid).then(function() {
+            showAutoFindToast(best);
+            reportFoundQuizToSite({
+                uuid: best.uuid,
+                title: best.title,
+                match: Math.round(best.score * 100),
+                question: stripHtml(best.candidateQuestion.question || ''),
+                correctAnswers: (best.candidateQuestion.choices || [])
+                    .filter(function(c){ return c.correct; })
+                    .map(function(c){ return c.answer || ''; }),
+                foundAt: Date.now()
+            });
+        }).catch(function(e) { console.warn('KahootHelper Auto-Find: Quiz konnte nicht geladen werden', e); });
+    }
+
+    function showAutoFindToast(best) {
+        try {
+            var old = document.querySelector('.kahoot-helper-autofind-toast');
+            if (old) old.remove();
+            var toast = document.createElement('div');
+            toast.className = 'kahoot-helper-autofind-toast';
+            toast.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);background:#2b2b2b;color:#fff;padding:10px 18px;border-radius:10px;z-index:10050;font-family:Montserrat,Arial,sans-serif;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,.5);border-left:5px solid #4CAF50;max-width:90vw;text-align:center;';
+            toast.innerHTML = '<b style="color:#4CAF50">✓ Auto-Find:</b> „' + (best.title || 'Quiz').replace(/</g,'&lt;') +
+                '“ (' + Math.round(best.score*100) + '% Match) – ID <code>' + best.uuid + '</code> ins Menü eingebaut.';
+            document.body.appendChild(toast);
+            setTimeout(function(){ toast.remove(); }, 8000);
+        } catch (e) {}
+    }
+
     // ===================== KAHOOT-START =====================
     // Der eigentliche Start (UI + Loop) laeuft erst, wenn Kahoot-Struktur vorhanden ist.
+    var _startQueued = false;
     function startKahootHelper() {
+        // Auf der eigenen Website (data-kahoot-helper-theme="kahoot") und bei
+        // document-start darf die UI erst angefuegt werden, wenn document.body
+        // existiert – bis dahin wird der Start auf DOMContentLoaded verschoben.
+        if (document.readyState === 'loading' || !document.body) {
+            if (_startQueued) return;
+            _startQueued = true;
+            document.addEventListener('DOMContentLoaded', function() { startKahootHelper(); });
+            return;
+        }
         if (window.__kahootHelperStarted) return;
         window.__kahootHelperStarted = true;
 
@@ -2373,6 +2594,13 @@
             var btn = FindByAttributeValue("data-functional-selector", 'answer-' + idx, "button");
             if (btn) {
                 btn.click();
+                // Zusaetzlich Tastatur-Event dispatchen: auf dem echten kahoot.it
+                // hoert die App primaes auf keydown – so funktioniert der Autoklick
+                // sowohl im Original als auch in allen Klonen/der eigenen Website.
+                try {
+                    window.dispatchEvent(new KeyboardEvent('keydown', { key: String(idx + 1), bubbles: true }));
+                    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: String(idx + 1), bubbles: true }));
+                } catch (e) {}
                 return true;
             }
             const event = new KeyboardEvent('keydown', { key: (idx + 1).toString() });
@@ -2408,6 +2636,23 @@
             info.lastAnsweredQuestion = info.questionNum;
             onQuestionStart();
         }
+
+        // ===== AUTO-FIND: frage die Kahoot-Bibliothek automatisch ab =====
+        // Sobald auf dem Bildschirm Fragen-/Antwort-Buttons sichtbar sind und noch
+        // kein Quiz geladen ist, werden die ersten 1-3 Fragen ausgelesen und
+        // automatisch das passende echte Kahoot-Quiz samt ID gesucht & eingebaut.
+        try {
+            var _liveQ = readLiveQuestion();
+            if (_liveQ && questions.length === 0 && !autoFindRunning) {
+                if (_liveQ.question !== lastQuestionTextSeen) {
+                    lastQuestionTextSeen = _liveQ.question;
+                    if (!autoFindDoneFor[_liveQ.question]) {
+                        autoFindDoneFor[_liveQ.question] = true;
+                        runAutoFind(_liveQ);
+                    }
+                }
+            }
+        } catch (e) {}
         if (autoAnswer){
             if (info.ILSetQuestion != info.questionNum){
                 var ppt = Answered_PPT;
@@ -2673,6 +2918,18 @@
     
     // Run after a short delay to ensure DOM is ready
     setTimeout(applyBadgeClasses, 500);
+
+    // === Start-Block: lokales Demo-Quiz laden (eigene Website). Die UI wird
+    // bereits beim Erstellen an den Body angefuegt; hier laden wir nur das
+    // lokale Quiz nach, sobald body existiert. ===
+    function _khInitLocalQuiz() {
+        try { loadLocalQuizzes(); } catch (e) {}
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', _khInitLocalQuiz);
+    } else {
+        setTimeout(_khInitLocalQuiz, 0);
+    }
     } // <-- end of startKahootHelper()
 
     // Auf echten Kahoot-Domains (oder bereits erkanntem Kahoot-Layout) sofort starten.
